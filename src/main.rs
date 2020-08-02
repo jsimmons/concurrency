@@ -1,3 +1,4 @@
+use std::os::unix::thread::JoinHandleExt;
 use std::{
     cell::UnsafeCell,
     sync::{
@@ -7,6 +8,8 @@ use std::{
     thread,
     time::Instant,
 };
+
+use libc::{self, setpriority, PRIO_PROCESS};
 
 trait Universe {
     fn name(&self) -> &'static str;
@@ -49,13 +52,14 @@ impl Universe for SingleThreadUniverse {
 }
 
 struct ThreadPerWorldUniverse {
+    use_prio: bool,
     step_count: Arc<AtomicU64>,
     frame_begin: Arc<Barrier>,
     frame_end: Arc<Barrier>,
 }
 
 impl ThreadPerWorldUniverse {
-    fn new(num_fast: usize, num_slow: usize) -> Self {
+    fn new(num_fast: usize, num_slow: usize, use_prio: bool) -> Self {
         let num_worlds = num_fast + num_slow;
         let step_count = Arc::new(AtomicU64::new(0));
         let frame_begin = Arc::new(Barrier::new(num_worlds + 1));
@@ -67,12 +71,26 @@ impl ThreadPerWorldUniverse {
             let frame_end = frame_end.clone();
             let mut world = World::new(world_type);
 
-            thread::spawn(move || loop {
+            let thread = thread::spawn(move || loop {
                 frame_begin.wait();
                 world.step();
                 step_count.fetch_add(1, Ordering::Relaxed);
                 frame_end.wait();
             });
+
+            if use_prio {
+                unsafe {
+                    setpriority(
+                        PRIO_PROCESS,
+                        thread.as_pthread_t() as u32,
+                        if world_type == WorldType::Slow {
+                            10
+                        } else {
+                            15
+                        },
+                    );
+                }
+            }
         };
 
         for _ in 0..num_fast {
@@ -84,6 +102,7 @@ impl ThreadPerWorldUniverse {
         }
 
         Self {
+            use_prio,
             step_count,
             frame_begin,
             frame_end,
@@ -93,7 +112,11 @@ impl ThreadPerWorldUniverse {
 
 impl Universe for ThreadPerWorldUniverse {
     fn name(&self) -> &'static str {
-        "Single Thread Per World"
+        if self.use_prio {
+            "Single Thread Per World Prio Boost"
+        } else {
+            "Single Thread Per World"
+        }
     }
 
     fn step(&mut self) {
@@ -232,18 +255,21 @@ impl World {
 }
 
 fn main() {
-    let num_fast = 100;
-    let num_slow = 30;
+    let num_fast = 900;
+    let num_slow = 100;
+    let num_frames = 60;
 
-    println!("Stepping {} fast, and {} slow worlds.", num_fast, num_slow);
+    println!(
+        "Stepping {} fast, and {} slow worlds for {} frames.",
+        num_fast, num_slow, num_frames
+    );
 
     let mut universes: [&mut dyn Universe; 3] = [
-        &mut SingleThreadUniverse::new(num_fast, num_slow),
-        &mut ThreadPerWorldUniverse::new(num_fast, num_slow),
+        //&mut SingleThreadUniverse::new(num_fast, num_slow),
         &mut TaskPerWorldUniverse::new(num_fast, num_slow),
+        &mut ThreadPerWorldUniverse::new(num_fast, num_slow, false),
+        &mut ThreadPerWorldUniverse::new(num_fast, num_slow, true),
     ];
-
-    let num_frames = 30;
 
     let mut frame_times = Vec::with_capacity(num_frames as usize);
 
@@ -290,7 +316,7 @@ fn main() {
             let secs = x.as_secs_f64();
             Stats {
                 min: acc.min.min(secs),
-                max: acc.min.max(secs),
+                max: acc.max.max(secs),
                 sum: acc.sum + secs,
                 count: acc.count + 1.0,
             }
@@ -299,11 +325,10 @@ fn main() {
         frame_times.clear();
 
         println!(
-            "took {:?} for {} steps over {} frames. {:?} per frame",
+            "took {:?} for {} steps over {} frames",
             duration,
             verse.step_count(),
             num_frames,
-            duration / num_frames as u32
         );
 
         println!(
